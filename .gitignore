@@ -1,0 +1,17 @@
+# Gradle / Android Studio
+.gradle/
+build/
+app/build/
+local.properties
+.idea/
+*.iml
+captures/
+.cxx/
+.kotlin/
+
+# Python
+.venv/
+__pycache__/
+
+# Datos de captura (biométricos, no se versionan)
+datos/
