@@ -42,6 +42,13 @@ object Config {
     var settleMs = 300L                      // tiempo sostenido bajo settleVar para declarar "estabilizado"
     var transitionTimeoutMs = 6_000L         // si no se enciende la pantalla en este tiempo: falso disparo
     var restMs = 2_000L                      // tiempo quieto para declarar reposo (mesa)
+    var storeGuardMs = 2_000L                // tras pasar a STORED, sin motion_tilt: el gesto de guardarlo no es una toma
+
+    // --- Análisis por episodio (al escribirlo) ---
+    var onsetWindowMs = 300L                 // ventana para buscar el último tramo quieto antes de la toma
+    var onsetAccVar = 0.05f                  // var(|a|) de un tramo quieto
+    var onsetGyrRadS = 0.3f                  // |ω| máximo de un tramo quieto
+    var inPlaceTiltDeg = 15f                 // giro máximo de la gravedad para decir "no se movió de su sitio"
 
     // --- Metadatos del estudio ---
     var subjectId = "S00"

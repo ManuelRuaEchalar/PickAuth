@@ -40,6 +40,7 @@ class PickupStateMachine(private val cb: Callback) {
     private var restGravity: FloatArray? = null
     private var stillSince = 0L
     private var settleSince = 0L
+    private var storedSince = 0L
 
     private val ms = 1_000_000L
 
@@ -61,6 +62,10 @@ class PickupStateMachine(private val cb: Callback) {
         when (state) {
             PhoneState.UNKNOWN, PhoneState.STORED, PhoneState.ON_SURFACE, PhoneState.HELD -> {
                 if (variance < Config.stillVar) { if (stillSince == 0L) stillSince = t } else stillSince = 0L
+                // Justo después de guardarlo, el teléfono aún se está acomodando en el bolsillo:
+                // la orientación de referencia sigue a la actual y no se evalúa motion_tilt.
+                val storing = state == PhoneState.STORED && t - storedSince < Config.storeGuardMs * ms
+                if (storing) restGravity = g.copyOf()
                 val tilt = restGravity?.let { MotionTracker.angleDeg(it, g) } ?: 0f
 
                 when {
@@ -68,7 +73,7 @@ class PickupStateMachine(private val cb: Callback) {
                         startTransition(t, "motion_from_surface")
                     // Respaldo cuando proximidad/luz no reportan (o quedan "pegados") con pantalla apagada.
                     // Caminar mueve mucho pero cambia poco la gravedad media; sacar el teléfono la cambia bastante.
-                    state == PhoneState.STORED && variance > Config.motionVar && tilt > Config.tiltDeg ->
+                    !storing && state == PhoneState.STORED && variance > Config.motionVar && tilt > Config.tiltDeg ->
                         startTransition(t, "motion_tilt")
                     !screenOn -> evaluateRest(t, g, variance)
                 }
@@ -122,7 +127,12 @@ class PickupStateMachine(private val cb: Callback) {
             proxNear == true && dark -> {
                 // Mientras está guardado, la orientación de referencia se actualiza (caminar la cambia poco).
                 if (variance < Config.motionVar) restGravity = g.copyOf()
-                if (state != PhoneState.STORED) move(t, PhoneState.STORED, "prox_near_dark")
+                if (state != PhoneState.STORED) {
+                    // La referencia anterior era la de la mano o la mesa: se reemplaza por la actual.
+                    restGravity = g.copyOf()
+                    storedSince = t
+                    move(t, PhoneState.STORED, "prox_near_dark")
+                }
             }
             stillSince != 0L && t - stillSince > Config.restMs * ms && abs(g[2]) > 9.0f -> {
                 restGravity = g.copyOf()
