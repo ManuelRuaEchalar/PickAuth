@@ -63,7 +63,11 @@ class CaptureService : Service(), SensorEventListener, PickupStateMachine.Callba
     private var tScreenOn = 0L
     private var pendingDump: Runnable? = null
     private var episodes = 0
+    private var withPickup = 0
+    private var inPlace = 0
     private var falseTriggers = 0
+    private var lastState = ""
+    private var lastStateWallMs = 0L
     private var lastFalseDumpNs = 0L
 
     // ------------------------------------------------------------------ ciclo de vida
@@ -127,6 +131,7 @@ class CaptureService : Service(), SensorEventListener, PickupStateMachine.Callba
         val kg = getSystemService(KEYGUARD_SERVICE) as KeyguardManager
         events.add(SystemClock.elapsedRealtimeNanos(), "service_start",
             "mode=${Config.captureMode};secure_lock=${kg.isDeviceSecure}")
+        refreshStatus()
     }
 
     override fun onDestroy() {
@@ -137,6 +142,7 @@ class CaptureService : Service(), SensorEventListener, PickupStateMachine.Callba
             thread.quitSafely()
         }
         wakeLock?.let { if (it.isHeld) it.release() }
+        status = "detenido"
         super.onDestroy()
     }
 
@@ -231,11 +237,15 @@ class CaptureService : Service(), SensorEventListener, PickupStateMachine.Callba
 
     override fun onState(t: Long, from: PhoneState, to: PhoneState, reason: String) {
         events.add(t, "state", "$from>$to:$reason")
+        lastState = "$to ($reason)"
+        lastStateWallMs = System.currentTimeMillis()
+        refreshStatus()
     }
 
     override fun onFalseTrigger(t: Long, origin: Origin) {
         falseTriggers++
         events.add(t, "false_trigger", origin.name)
+        refreshStatus()
         // Se guardan como negativos para calibrar el detector, con límite para no llenar el disco.
         if (t - lastFalseDumpNs > 120 * SEC) {
             lastFalseDumpNs = t
@@ -276,6 +286,8 @@ class CaptureService : Service(), SensorEventListener, PickupStateMachine.Callba
             .put("screen_to_unlock_ms", if (tScr > 0) (tUnlock - tScr) / 1e6 else -1.0)
         val dir = writer.write("unlock", from, to, streams, events.slice(from, to), meta)
         episodes++
+        if (tTr > 0) withPickup++
+        refreshStatus()
         askForLabel(dir)
         updateCaptureNotification()
     }
@@ -303,7 +315,21 @@ class CaptureService : Service(), SensorEventListener, PickupStateMachine.Callba
             append("\n")
         })
         count.clear(); gaps.clear(); gapNs.clear()
-        status = "modo=${Config.captureMode} episodios=$episodes falsos=$falseTriggers batería=$battery% estado=${fsm.state}"
+        refreshStatus()
+    }
+
+    /** Estado en vivo para el panel: se actualiza en cada cambio de estado, episodio o falso disparo. */
+    private fun refreshStatus() {
+        val bm = getSystemService(BATTERY_SERVICE) as BatteryManager
+        val battery = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+        val hhmmss = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
+        status = buildString {
+            append("activo, modo ${Config.captureMode}, batería $battery%\n")
+            append("  estado: ${lastState.ifEmpty { fsm.state.name }}")
+            if (lastStateWallMs > 0) append(" desde ${hhmmss.format(java.util.Date(lastStateWallMs))}")
+            append("\n  desbloqueos: $episodes (con toma: $withPickup, sin toma: ${episodes - withPickup - inPlace}, en su sitio: $inPlace)\n")
+            append("  falsos disparos: $falseTriggers")
+        }
     }
 
     // ------------------------------------------------------------------ notificaciones
@@ -353,6 +379,6 @@ class CaptureService : Service(), SensorEventListener, PickupStateMachine.Callba
         const val NOTIF_LABEL = 2
         const val CH_CAPTURE = "capture"
         const val CH_LABEL = "label"
-        @Volatile var status: String = "sin datos aún"
+        @Volatile var status: String = "detenido"
     }
 }

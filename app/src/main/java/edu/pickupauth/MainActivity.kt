@@ -8,6 +8,8 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
 import android.widget.Button
@@ -25,6 +27,14 @@ import androidx.core.content.ContextCompat
 class MainActivity : Activity() {
 
     private lateinit var out: TextView
+    private lateinit var live: TextView
+    private val ui = Handler(Looper.getMainLooper())
+    private val tick = object : Runnable {
+        override fun run() {
+            live.text = "Servicio: ${CaptureService.status}"
+            ui.postDelayed(this, 1000)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -37,6 +47,8 @@ class MainActivity : Activity() {
             col.addView(Button(this).apply { text = label; setOnClickListener { action() } })
 
         col.addView(TextView(this).apply { text = "PickupAuth · prototipo de captura"; textSize = 20f })
+        live = TextView(this).apply { textSize = 13f; setPadding(0, 16, 0, 16) }
+        col.addView(live)
 
         // --- Sujeto y sesión ---
         val subject = EditText(this).apply { hint = "ID de sujeto (p. ej. S01)"; setText(Config.subjectId) }
@@ -87,6 +99,10 @@ class MainActivity : Activity() {
         setContentView(ScrollView(this).apply { addView(col) })
         show(statusText())
     }
+
+    override fun onResume() { super.onResume(); ui.post(tick) }
+
+    override fun onPause() { ui.removeCallbacks(tick); super.onPause() }
 
     private fun statusText(): String {
         val pm = getSystemService(POWER_SERVICE) as PowerManager
