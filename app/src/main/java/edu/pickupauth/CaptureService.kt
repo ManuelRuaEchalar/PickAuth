@@ -249,8 +249,12 @@ class CaptureService : Service(), SensorEventListener, PickupStateMachine.Callba
         // Se guardan como negativos para calibrar el detector, con límite para no llenar el disco.
         if (t - lastFalseDumpNs > 120 * SEC) {
             lastFalseDumpNs = t
-            val from = fsm.tTransition - (Config.marginSeconds + 2) * SEC
-            val meta = JSONObject().put("origin_detected", origin.name).put("t_transition_ns", fsm.tTransition)
+            val tOnset = motionOnset(fsm.tTransition)
+            var from = fsm.tTransition - (Config.marginSeconds + 2) * SEC
+            if (tOnset > 0) from = min(from, tOnset - Config.marginSeconds * SEC)
+            val meta = JSONObject().put("origin_detected", origin.name)
+                .put("t_motion_onset_ns", tOnset)
+                .put("t_transition_ns", fsm.tTransition)
             writer.write("false_trigger", from, t, streams, events.slice(from, t), meta)
         }
     }
@@ -273,12 +277,25 @@ class CaptureService : Service(), SensorEventListener, PickupStateMachine.Callba
         handler.postDelayed(r, Config.postUnlockSeconds * 1000)
     }
 
+    private fun motionOnset(anchor: Long): Long {
+        val acc = streams["acc"]?.slice(anchor - 7 * SEC, anchor) ?: return 0L
+        val gyr = streams["gyr"]?.slice(anchor - 7 * SEC, anchor) ?: return 0L
+        return EpisodeAnalysis.motionOnset(acc, gyr, anchor)
+    }
+
     private fun writeUnlockEpisode(tUnlock: Long, origin: Origin, tTr: Long, tSet: Long, tScr: Long) {
         val preFrom = tUnlock - Config.preUnlockSeconds * SEC
-        val from = if (tTr > 0) min(preFrom, tTr - Config.marginSeconds * SEC) else preFrom
         val to = tUnlock + Config.postUnlockSeconds * SEC
+        // El movimiento real empieza antes del disparo: se busca el último tramo quieto hacia atrás.
+        val anchor = if (tTr > 0) tTr else if (tScr > 0) min(tScr, tUnlock) else tUnlock
+        val tOnset = motionOnset(anchor)
+        var from = preFrom
+        if (tTr > 0) from = min(from, tTr - Config.marginSeconds * SEC)
+        if (tOnset > 0) from = min(from, tOnset - Config.marginSeconds * SEC)
         val meta = JSONObject()
             .put("origin_detected", origin.name)
+            .put("pickup_detected", tTr > 0)
+            .put("t_motion_onset_ns", tOnset)
             .put("t_transition_ns", tTr)
             .put("t_settled_ns", tSet)
             .put("t_screen_on_ns", tScr)
