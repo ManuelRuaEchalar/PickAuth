@@ -12,6 +12,8 @@ Qué reporta:
   * huecos máximos por sensor
   * frecuencia efectiva de muestreo
   * matriz origen detectado vs. etiqueta del usuario (precisión del detector de "sacado del bolsillo")
+  * cobertura del detector: qué parte de los desbloqueos tuvo toma detectada, sin toma o en su sitio
+  * adelanto del inicio real del movimiento respecto al disparo
   * falsos disparos por hora (desde stats.csv)
 """
 import argparse
@@ -25,7 +27,7 @@ import pandas as pd
 
 LABEL_TO_ORIGIN = {
     "pocket_front": "POCKET_OR_BAG", "pocket_back": "POCKET_OR_BAG", "jacket": "POCKET_OR_BAG",
-    "bag": "POCKET_OR_BAG", "table": "SURFACE", "hand": "HAND",
+    "bag": "POCKET_OR_BAG", "table": "SURFACE", "hand": "HAND", "not_lifted": "NOT_LIFTED",
 }
 
 
@@ -49,6 +51,10 @@ def coverage_row(ep: dict) -> dict:
         "episode": ep["dir"].name, "kind": m["kind"], "mode": m["config"]["mode"],
         "origin_detected": m.get("origin_detected"), "label": ep["label"],
         "screen_to_unlock_ms": m.get("screen_to_unlock_ms"),
+        # Episodios anteriores a este campo: se deduce de t_transition_ns.
+        "pickup_detected": m.get("pickup_detected", m.get("t_transition_ns", 0) > 0),
+        "onset_before_trigger_s": round((m["t_transition_ns"] - m["t_motion_onset_ns"]) / 1e9, 2)
+        if m.get("t_motion_onset_ns") and m.get("t_transition_ns") else np.nan,
     }
     for s in ("acc", "gyr", "mag"):
         df = ep.get(s)
@@ -91,7 +97,8 @@ def plot_episode(ep: dict, out: Path):
             ax.step(tt, list(df["x"]) + [df["x"].iloc[-1]], where="post", color=col, label=s)
     ax.set_yscale("symlog"); ax.legend(loc="upper left", fontsize=7); ax.set_xlabel("s respecto al desbloqueo")
 
-    marks = {"t_transition_ns": ("inicio toma", "tab:red"), "t_settled_ns": ("estabilizado", "tab:green"),
+    marks = {"t_motion_onset_ns": ("inicio movimiento", "tab:brown"),
+             "t_transition_ns": ("inicio toma", "tab:red"), "t_settled_ns": ("estabilizado", "tab:green"),
              "t_screen_on_ns": ("pantalla on", "tab:blue"), "t_user_present_ns": ("desbloqueo", "k")}
     for key, (lab, col) in marks.items():
         v = m.get(key, 0)
@@ -123,6 +130,23 @@ def main():
     print(cov.groupby(["kind", "mode"]).size().rename("n").to_string())
 
     unl = cov[cov.kind == "unlock"]
+    allu = cov[cov.kind.isin(["unlock", "in_place"])]
+    if len(allu):
+        n = len(allu)
+        n_pick = int((unl["pickup_detected"] == True).sum())
+        n_place = int((allu.kind == "in_place").sum())
+        n_miss = n - n_pick - n_place
+        print("\n== Cobertura del detector (todos los desbloqueos) ==")
+        print(f"Con toma detectada:           {n_pick:4d} ({n_pick / n:.0%})")
+        print(f"Sin toma, pero se movió:      {n_miss:4d} ({n_miss / n:.0%})   <- tomas que se le escapan al detector")
+        print(f"En su sitio (no se levantó):  {n_place:4d} ({n_place / n:.0%})")
+        moved = n - n_place
+        if moved:
+            print(f"Tomas detectadas / desbloqueos con movimiento: {n_pick / moved:.0%} (Secure Pick Up: 35,6 %)")
+        ob = unl["onset_before_trigger_s"].dropna()
+        if len(ob):
+            print(f"Inicio real del movimiento antes del disparo: mediana {ob.median():.2f} s (min {ob.min():.2f}, max {ob.max():.2f})")
+
     if len(unl):
         print("\n== Cobertura IMU en episodios de desbloqueo (por modo) ==")
         cols = [c for c in unl.columns if c.endswith(("_hz", "_late_s", "_maxgap_ms", "_pre_unlock_s"))]
