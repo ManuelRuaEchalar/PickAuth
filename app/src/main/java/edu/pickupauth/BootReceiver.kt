@@ -3,17 +3,24 @@ package edu.pickupauth
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import androidx.core.content.ContextCompat
 
 /**
- * Reinicia la captura tras reiniciar el teléfono si el usuario lo activó.
- * Nota: Android 15 prohíbe iniciar ciertos tipos de servicio (dataSync, mediaPlayback, cámara, micrófono…)
- * desde BOOT_COMPLETED; "health" no está en esa lista, pero verifícalo en tu dispositivo (fase 1).
+ * Restaura la captura sin que nadie abra la app:
+ *  - al encender el teléfono (si "reiniciar al encender" está activo, por defecto sí);
+ *  - al actualizar la app (siempre, si la captura estaba activa).
+ * Android 12+ permite iniciar un servicio en primer plano desde estos dos broadcasts.
+ * El BOOT_COMPLETED llega recién tras el primer desbloqueo, así que ese primer desbloqueo no se captura.
  */
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
-        val autostart = context.getSharedPreferences("cfg", Context.MODE_PRIVATE).getBoolean("autostart", false)
-        if (autostart) ContextCompat.startForegroundService(context, Intent(context, CaptureService::class.java))
+        val reason = when (intent.action) {
+            Intent.ACTION_BOOT_COMPLETED -> "boot"
+            Intent.ACTION_MY_PACKAGE_REPLACED -> "update"
+            else -> return
+        }
+        Lifecycle.log(context, reason)
+        if (!Capture.isEnabled(context)) return
+        if (reason == "boot" && !Capture.autostart(context)) return
+        Capture.start(context, reason)
     }
 }

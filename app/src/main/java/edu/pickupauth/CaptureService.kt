@@ -81,6 +81,8 @@ class CaptureService : Service(), SensorEventListener, PickupStateMachine.Callba
         ServiceCompat.startForeground(this, NOTIF_CAPTURE, captureNotification(), type)
         if (!started) {
             started = true
+            running = true
+            Lifecycle.log(this, "service_start", intent?.getStringExtra(EXTRA_REASON) ?: "system_restart")
             setup()
         }
         return START_STICKY
@@ -142,6 +144,8 @@ class CaptureService : Service(), SensorEventListener, PickupStateMachine.Callba
             thread.quitSafely()
         }
         wakeLock?.let { if (it.isHeld) it.release() }
+        running = false
+        Lifecycle.log(this, "service_stop")
         status = "detenido"
         super.onDestroy()
     }
@@ -321,6 +325,7 @@ class CaptureService : Service(), SensorEventListener, PickupStateMachine.Callba
 
     private val statsTick = object : Runnable {
         override fun run() {
+            Lifecycle.log(this@CaptureService, "alive")
             writeStats()
             handler.postDelayed(this, STATS_PERIOD_MS)
         }
@@ -404,6 +409,9 @@ class CaptureService : Service(), SensorEventListener, PickupStateMachine.Callba
         const val NOTIF_LABEL = 2
         const val CH_CAPTURE = "capture"
         const val CH_LABEL = "label"
+        const val EXTRA_REASON = "reason"
         @Volatile var status: String = "detenido"
+        /** true mientras el servicio está vivo en este proceso (si el proceso muere, vuelve a false). */
+        @Volatile var running = false
     }
 }
