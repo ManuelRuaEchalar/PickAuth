@@ -19,7 +19,7 @@ class EpisodeWriter(private val ctx: Context) {
     }
 
     fun write(
-        kind: String,                         // "unlock" | "false_trigger"
+        kind: String,                         // "unlock" | "in_place" | "false_trigger"
         fromNs: Long, toNs: Long,
         streams: Map<String, Vec3Ring>,
         events: List<EventLog.Event>,

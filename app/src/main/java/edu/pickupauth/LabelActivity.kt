@@ -21,7 +21,7 @@ class LabelActivity : Activity() {
             setPadding(48, 96, 48, 48)
         }
         layout.addView(TextView(this).apply {
-            text = "¿De dónde sacaste el teléfono en el último desbloqueo?"
+            text = "¿De dónde tomaste el teléfono en el último desbloqueo?"
             textSize = 18f
             setPadding(0, 0, 0, 32)
         })
@@ -43,6 +43,7 @@ class LabelActivity : Activity() {
             "bag" to "Bolsa / mochila",
             "table" to "Mesa u otra superficie",
             "hand" to "Ya estaba en mi mano",
+            "not_lifted" to "No lo levanté (lo usé donde estaba)",
             "not_owner" to "No fui yo (otra persona)",
             "unsure" to "No recuerdo"
         )

@@ -301,11 +301,19 @@ class CaptureService : Service(), SensorEventListener, PickupStateMachine.Callba
             .put("t_screen_on_ns", tScr)
             .put("t_user_present_ns", tUnlock)
             .put("screen_to_unlock_ms", if (tScr > 0) (tUnlock - tScr) / 1e6 else -1.0)
-        val dir = writer.write("unlock", from, to, streams, events.slice(from, to), meta)
+        // Sin toma y sin moverse de su sitio en toda la ventana (p. ej. desbloqueado sobre la mesa):
+        // se guarda aparte y no se pregunta, porque ya se sabe que no se levantó.
+        val inPlaceEp = tTr == 0L && EpisodeAnalysis.stayedInPlace(
+            streams["acc"]?.slice(preFrom, to) ?: emptyList(), preFrom, to)
+        meta.put("moved", !inPlaceEp)
+        val dir = writer.write(if (inPlaceEp) "in_place" else "unlock", from, to, streams, events.slice(from, to), meta)
         episodes++
-        if (tTr > 0) withPickup++
+        when {
+            tTr > 0 -> withPickup++
+            inPlaceEp -> inPlace++
+        }
         refreshStatus()
-        askForLabel(dir)
+        if (!inPlaceEp) askForLabel(dir, pickupDetected = tTr > 0)
         updateCaptureNotification()
     }
 
@@ -373,13 +381,13 @@ class CaptureService : Service(), SensorEventListener, PickupStateMachine.Callba
     }
 
     /** Muestreo de experiencia: el usuario indica de dónde sacó el teléfono (etiqueta de verdad de terreno). */
-    private fun askForLabel(dir: File) {
+    private fun askForLabel(dir: File, pickupDetected: Boolean) {
         val i = Intent(this, LabelActivity::class.java).putExtra(LabelActivity.EXTRA_DIR, dir.name)
         val pi = PendingIntent.getActivity(this, dir.name.hashCode(), i,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         val n = NotificationCompat.Builder(this, CH_LABEL)
             .setSmallIcon(android.R.drawable.ic_menu_help)
-            .setContentTitle("¿De dónde sacaste el teléfono?")
+            .setContentTitle(if (pickupDetected) "¿De dónde sacaste el teléfono?" else "¿Levantaste el teléfono antes de desbloquear?")
             .setContentText("Toca para etiquetar el último desbloqueo")
             .setContentIntent(pi)
             .setAutoCancel(true)
