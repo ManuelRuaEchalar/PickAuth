@@ -1,5 +1,7 @@
 package edu.pickupauth
 
+import android.app.ActivityManager
+import android.app.ApplicationExitInfo
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -32,7 +34,8 @@ import kotlin.math.min
 /**
  * Servicio en primer plano (tipo "health") que:
  *  1. mantiene los sensores registrados en todo momento y llena buffers circulares;
- *  2. escucha pantalla encendida/apagada y desbloqueo (USER_PRESENT);
+ *  2. escucha pantalla encendida/apagada y desbloqueo (USER_PRESENT) y, como respaldo para los
+ *     fabricantes que no entregan esos broadcasts, consulta el estado de la pantalla cada 200 ms;
  *  3. alimenta la máquina de estados;
  *  4. al desbloquear, espera `postUnlockSeconds` y guarda el episodio [inicio de la toma − margen, desbloqueo + x];
  *  5. cada 10 min escribe estadísticas de huecos y batería (criterio de salida de la fase 1).
@@ -47,6 +50,8 @@ class CaptureService : Service(), SensorEventListener, PickupStateMachine.Callba
     private lateinit var writer: EpisodeWriter
     private lateinit var motion: MotionTracker
     private lateinit var fsm: PickupStateMachine
+    private lateinit var pm: PowerManager
+    private lateinit var kg: KeyguardManager
     private var wakeLock: PowerManager.WakeLock? = null
 
     private val events = EventLog()
@@ -56,11 +61,16 @@ class CaptureService : Service(), SensorEventListener, PickupStateMachine.Callba
     private val count = HashMap<String, Long>()
     private val gaps = HashMap<String, Long>()
     private val gapNs = HashMap<String, Long>()
+    private val gapThresholdNs = HashMap<String, Long>()
     private val clockChecked = HashSet<String>()
 
     private var started = false
     private var screenOn = true
     private var tScreenOn = 0L
+    private var screenOnSource = ""
+    private var unlocked = false
+    private var sawLocked = false          // el keyguard estuvo puesto desde el último desbloqueo
+    private val lastPollT = HashMap<String, Long>()
     private var pendingDump: Runnable? = null
     private var episodes = 0
     private var withPickup = 0
@@ -82,7 +92,9 @@ class CaptureService : Service(), SensorEventListener, PickupStateMachine.Callba
         if (!started) {
             started = true
             running = true
+            installCrashLogger()
             Lifecycle.log(this, "service_start", intent?.getStringExtra(EXTRA_REASON) ?: "system_restart")
+            logExitReasons()
             setup()
         }
         return START_STICKY
@@ -98,11 +110,13 @@ class CaptureService : Service(), SensorEventListener, PickupStateMachine.Callba
         val imuCap = (Config.bufferSeconds * rateHz * 1.3).toInt()
         motion = MotionTracker(windowSamples = maxOf(10, rateHz / 2))   // ~0,5 s
         fsm = PickupStateMachine(this)
-        val pmNow = getSystemService(POWER_SERVICE) as PowerManager
-        screenOn = pmNow.isInteractive
+        pm = getSystemService(POWER_SERVICE) as PowerManager
+        kg = getSystemService(KEYGUARD_SERVICE) as KeyguardManager
+        screenOn = pm.isInteractive
+        sawLocked = kg.isKeyguardLocked
+        unlocked = screenOn && !sawLocked
         fsm.onScreen(SystemClock.elapsedRealtimeNanos(), screenOn)
         if (Config.captureMode == CaptureMode.WAKELOCK) {
-            val pm = getSystemService(POWER_SERVICE) as PowerManager
             wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "pickupauth:capture").apply {
                 setReferenceCounted(false); acquire()
             }
@@ -130,7 +144,7 @@ class CaptureService : Service(), SensorEventListener, PickupStateMachine.Callba
         ContextCompat.registerReceiver(this, screenReceiver, filter, null, handler, ContextCompat.RECEIVER_NOT_EXPORTED)
 
         handler.postDelayed(statsTick, STATS_PERIOD_MS)
-        val kg = getSystemService(KEYGUARD_SERVICE) as KeyguardManager
+        handler.postDelayed(screenPoll, POLL_MS)
         events.add(SystemClock.elapsedRealtimeNanos(), "service_start",
             "mode=${Config.captureMode};secure_lock=${kg.isDeviceSecure}")
         refreshStatus()
@@ -160,9 +174,11 @@ class CaptureService : Service(), SensorEventListener, PickupStateMachine.Callba
         }
         names[s] = name
         streams[name] = Vec3Ring(cap)
+        // Hueco = más de 3 periodos reales: algunos sensores no llegan a la frecuencia pedida (p. ej. magnetómetro a 50 Hz).
+        gapThresholdNs[name] = 3L * maxOf(periodUs, s.minDelay) * 1000L
         val ok = sm.registerListener(this, s, periodUs, latencyUs, handler)
         events.add(SystemClock.elapsedRealtimeNanos(), "sensor_registered",
-            "$name;ok=$ok;wakeup=${s.isWakeUpSensor};fifoMax=${s.fifoMaxEventCount};fifoRes=${s.fifoReservedEventCount}")
+            "$name;ok=$ok;wakeup=${s.isWakeUpSensor};fifoMax=${s.fifoMaxEventCount};fifoRes=${s.fifoReservedEventCount};minDelayUs=${s.minDelay}")
     }
 
     // ------------------------------------------------------------------ sensores
@@ -206,7 +222,7 @@ class CaptureService : Service(), SensorEventListener, PickupStateMachine.Callba
         lastT[name] = t
         if (name !in IMU || prev == null) return
         val dt = t - prev
-        if (dt > 3L * Config.samplingPeriodUs * 1000L) {
+        if (dt > (gapThresholdNs[name] ?: (3L * Config.samplingPeriodUs * 1000L))) {
             gaps[name] = (gaps[name] ?: 0L) + 1
             gapNs[name] = (gapNs[name] ?: 0L) + dt
         }
@@ -218,25 +234,68 @@ class CaptureService : Service(), SensorEventListener, PickupStateMachine.Callba
         override fun onReceive(c: Context, i: Intent) {
             val t = SystemClock.elapsedRealtimeNanos()
             when (i.action) {
-                Intent.ACTION_SCREEN_ON -> {
-                    screenOn = true; tScreenOn = t
-                    events.add(t, "screen_on")
-                    fsm.onScreen(t, true)
-                    // En modos con batching: vaciar la FIFO para tener los segundos previos.
-                    if (Config.captureMode != CaptureMode.WAKELOCK) sm.flush(this@CaptureService)
-                }
-                Intent.ACTION_SCREEN_OFF -> {
-                    screenOn = false
-                    events.add(t, "screen_off")
-                    fsm.onScreen(t, false)
-                }
-                Intent.ACTION_USER_PRESENT -> {
-                    events.add(t, "user_present")
-                    fsm.onUserPresent(t)
-                    scheduleUnlockDump(t)
-                }
+                Intent.ACTION_SCREEN_ON -> onScreenOn(t, SRC_BROADCAST)
+                Intent.ACTION_SCREEN_OFF -> onScreenOff(t, SRC_BROADCAST)
+                Intent.ACTION_USER_PRESENT -> onUserPresent(t, SRC_BROADCAST)
             }
         }
+    }
+
+    /**
+     * Respaldo para teléfonos que no entregan SCREEN_ON / USER_PRESENT (visto en TECNO/HiOS).
+     * Solo genera el evento si el broadcast aún no llegó; el desbloqueo exige haber visto el keyguard
+     * puesto, para no inventar desbloqueos cuando la pantalla se enciende dentro del retardo de bloqueo.
+     */
+    private val screenPoll = object : Runnable {
+        override fun run() {
+            val t = SystemClock.elapsedRealtimeNanos()
+            val on = pm.isInteractive
+            val locked = kg.isKeyguardLocked
+            if (on && !screenOn) onScreenOn(t, SRC_POLL)
+            else if (!on && screenOn) onScreenOff(t, SRC_POLL)
+            if (locked) {
+                sawLocked = true
+                // Con la pantalla apagada y el keyguard puesto ya no está desbloqueado, aunque se haya perdido SCREEN_OFF.
+                if (!on) unlocked = false
+            } else if (on && sawLocked && !unlocked) onUserPresent(t, SRC_POLL)
+            handler.postDelayed(this, POLL_MS)
+        }
+    }
+
+    private fun onScreenOn(t: Long, src: String) {
+        if (screenOn) { lateBroadcast("screen_on", t, src); return }
+        screenOn = true; tScreenOn = t; screenOnSource = src
+        record(t, "screen_on", src)
+        fsm.onScreen(t, true)
+        // En modos con batching: vaciar la FIFO para tener los segundos previos.
+        if (Config.captureMode != CaptureMode.WAKELOCK) sm.flush(this)
+    }
+
+    private fun onScreenOff(t: Long, src: String) {
+        if (!screenOn) { lateBroadcast("screen_off", t, src); return }
+        screenOn = false; unlocked = false
+        record(t, "screen_off", src)
+        fsm.onScreen(t, false)
+    }
+
+    private fun onUserPresent(t: Long, src: String) {
+        if (unlocked) { lateBroadcast("user_present", t, src); return }
+        unlocked = true; sawLocked = false
+        record(t, "user_present", src)
+        fsm.onUserPresent(t)
+        scheduleUnlockDump(t, src)
+    }
+
+    private fun record(t: Long, name: String, src: String) {
+        events.add(t, name, src)
+        if (src == SRC_POLL) lastPollT[name] = t else lastPollT.remove(name)
+    }
+
+    /** El sondeo se adelantó al broadcast: se anota el retraso para medir cuánto se pierde con cada fuente. */
+    private fun lateBroadcast(name: String, t: Long, src: String) {
+        if (src != SRC_BROADCAST) return
+        val tPoll = lastPollT.remove(name) ?: return
+        events.add(t, "late_broadcast", "$name;ms=${(t - tPoll) / 1_000_000}")
     }
 
     override fun onState(t: Long, from: PhoneState, to: PhoneState, reason: String) {
@@ -265,17 +324,18 @@ class CaptureService : Service(), SensorEventListener, PickupStateMachine.Callba
 
     // ------------------------------------------------------------------ episodios
 
-    private fun scheduleUnlockDump(tUnlock: Long) {
+    private fun scheduleUnlockDump(tUnlock: Long, unlockSource: String) {
         pendingDump?.let { handler.removeCallbacks(it) }
         // Se congela lo que sabía la máquina de estados en el momento del desbloqueo.
         val origin = fsm.origin
         val tTr = fsm.tTransition
         val tSet = fsm.tSettled
         val tScr = tScreenOn
+        val sources = JSONObject().put("screen_on", screenOnSource).put("user_present", unlockSource)
         val r = Runnable {
             // Vaciar FIFOs para que lleguen las muestras de los últimos segundos antes de escribir.
             if (Config.captureMode != CaptureMode.WAKELOCK) sm.flush(this)
-            handler.postDelayed({ writeUnlockEpisode(tUnlock, origin, tTr, tSet, tScr) }, 500)
+            handler.postDelayed({ writeUnlockEpisode(tUnlock, origin, tTr, tSet, tScr, sources) }, 500)
         }
         pendingDump = r
         handler.postDelayed(r, Config.postUnlockSeconds * 1000)
@@ -287,7 +347,7 @@ class CaptureService : Service(), SensorEventListener, PickupStateMachine.Callba
         return EpisodeAnalysis.motionOnset(acc, gyr, anchor)
     }
 
-    private fun writeUnlockEpisode(tUnlock: Long, origin: Origin, tTr: Long, tSet: Long, tScr: Long) {
+    private fun writeUnlockEpisode(tUnlock: Long, origin: Origin, tTr: Long, tSet: Long, tScr: Long, sources: JSONObject) {
         val preFrom = tUnlock - Config.preUnlockSeconds * SEC
         val to = tUnlock + Config.postUnlockSeconds * SEC
         // El movimiento real empieza antes del disparo: se busca el último tramo quieto hacia atrás.
@@ -305,6 +365,8 @@ class CaptureService : Service(), SensorEventListener, PickupStateMachine.Callba
             .put("t_screen_on_ns", tScr)
             .put("t_user_present_ns", tUnlock)
             .put("screen_to_unlock_ms", if (tScr > 0) (tUnlock - tScr) / 1e6 else -1.0)
+            // broadcast | poll (el sondeo puede llegar hasta POLL_MS tarde)
+            .put("event_sources", sources)
         // Sin toma y sin moverse de su sitio en toda la ventana (p. ej. desbloqueado sobre la mesa):
         // se guarda aparte y no se pregunta, porque ya se sabe que no se levantó.
         val inPlaceEp = tTr == 0L && EpisodeAnalysis.stayedInPlace(
@@ -319,6 +381,61 @@ class CaptureService : Service(), SensorEventListener, PickupStateMachine.Callba
         refreshStatus()
         if (!inPlaceEp) askForLabel(dir, pickupDetected = tTr > 0)
         updateCaptureNotification()
+    }
+
+    // ------------------------------------------------------------------ diagnóstico de caídas
+
+    /** Motivo de las muertes anteriores del proceso (Android 11+): memoria, fallo, congelado, etc. */
+    private fun logExitReasons() {
+        if (Build.VERSION.SDK_INT < 30) return
+        val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
+        val last = prefs.getLong(KEY_LAST_EXIT, 0L)
+        val infos = try {
+            getSystemService(ActivityManager::class.java).getHistoricalProcessExitReasons(packageName, 0, 16)
+        } catch (e: Exception) {
+            Lifecycle.log(this, "exit_reason_failed", e.javaClass.simpleName); return
+        }.filter { it.timestamp > last }.sortedBy { it.timestamp }
+        for (x in infos) {
+            Lifecycle.log(this, "exit_reason", "at=${x.timestamp};reason=${exitReasonName(x.reason)};" +
+                "status=${x.status};importance=${x.importance};desc=${(x.description ?: "").replace('\n', ' ')}")
+        }
+        infos.lastOrNull()?.let { prefs.edit().putLong(KEY_LAST_EXIT, it.timestamp).apply() }
+    }
+
+    private fun exitReasonName(r: Int) = when (r) {
+        ApplicationExitInfo.REASON_EXIT_SELF -> "exit_self"
+        ApplicationExitInfo.REASON_SIGNALED -> "signaled"
+        ApplicationExitInfo.REASON_LOW_MEMORY -> "low_memory"
+        ApplicationExitInfo.REASON_CRASH -> "crash"
+        ApplicationExitInfo.REASON_CRASH_NATIVE -> "crash_native"
+        ApplicationExitInfo.REASON_ANR -> "anr"
+        ApplicationExitInfo.REASON_INITIALIZATION_FAILURE -> "init_failure"
+        ApplicationExitInfo.REASON_PERMISSION_CHANGE -> "permission_change"
+        ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> "excessive_resource_usage"
+        ApplicationExitInfo.REASON_USER_REQUESTED -> "user_requested"
+        ApplicationExitInfo.REASON_USER_STOPPED -> "user_stopped"
+        ApplicationExitInfo.REASON_DEPENDENCY_DIED -> "dependency_died"
+        ApplicationExitInfo.REASON_OTHER -> "other"
+        ApplicationExitInfo.REASON_FREEZER -> "freezer"
+        ApplicationExitInfo.REASON_PACKAGE_STATE_CHANGE -> "package_state_change"
+        ApplicationExitInfo.REASON_PACKAGE_UPDATED -> "package_updated"
+        else -> "unknown_$r"
+    }
+
+    /** Deja en lifecycle.csv la excepción que tumbó el proceso, antes de que Android lo cierre. */
+    private fun installCrashLogger() {
+        if (crashLoggerInstalled) return
+        crashLoggerInstalled = true
+        val app = applicationContext
+        val prev = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { th, e ->
+            try {
+                Lifecycle.log(app, "crash", "${th.name};${e.javaClass.name};${e.message ?: ""};${e.stackTrace.firstOrNull() ?: ""}"
+                    .replace('\n', ' '))
+            } catch (_: Throwable) {
+            }
+            prev?.uncaughtException(th, e)
+        }
     }
 
     // ------------------------------------------------------------------ estadísticas (fase 1)
@@ -405,6 +522,11 @@ class CaptureService : Service(), SensorEventListener, PickupStateMachine.Callba
         const val SEC = 1_000_000_000L
         val IMU = setOf("acc", "gyr", "mag")
         const val STATS_PERIOD_MS = 10 * 60 * 1000L
+        const val POLL_MS = 200L
+        const val SRC_BROADCAST = "broadcast"
+        const val SRC_POLL = "poll"
+        const val KEY_LAST_EXIT = "last_exit_reason_ms"
+        private var crashLoggerInstalled = false
         const val NOTIF_CAPTURE = 1
         const val NOTIF_LABEL = 2
         const val CH_CAPTURE = "capture"

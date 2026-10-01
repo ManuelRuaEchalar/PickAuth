@@ -14,7 +14,11 @@ Qué reporta:
   * matriz origen detectado vs. etiqueta del usuario (precisión del detector de "sacado del bolsillo")
   * cobertura del detector: qué parte de los desbloqueos tuvo toma detectada, sin toma o en su sitio
   * adelanto del inicio real del movimiento respecto al disparo
-  * falsos disparos por hora (desde stats.csv)
+  * falsos disparos por hora, descarga de batería y muestras perdidas (desde stats.csv)
+  * caídas del servicio y su motivo (desde lifecycle.csv)
+  * fuente de los eventos de pantalla/desbloqueo: broadcast o sondeo (app 0.3+)
+
+Lee datos de cualquier versión de la app: los campos nuevos de la 0.3 son opcionales.
 """
 import argparse
 import json
@@ -51,6 +55,9 @@ def coverage_row(ep: dict) -> dict:
         "episode": ep["dir"].name, "kind": m["kind"], "mode": m["config"]["mode"],
         "origin_detected": m.get("origin_detected"), "label": ep["label"],
         "screen_to_unlock_ms": m.get("screen_to_unlock_ms"),
+        "app_version": m.get("app_version", "<=0.2"),
+        # Antes de la 0.3 solo existía el broadcast.
+        "unlock_source": m.get("event_sources", {}).get("user_present", "broadcast"),
         # Episodios anteriores a este campo: se deduce de t_transition_ns.
         "pickup_detected": m.get("pickup_detected", m.get("t_transition_ns", 0) > 0),
         "onset_before_trigger_s": round((m["t_transition_ns"] - m["t_motion_onset_ns"]) / 1e9, 2)
@@ -112,6 +119,71 @@ def plot_episode(ep: dict, out: Path):
     plt.close(fig)
 
 
+def print_stats(st: pd.DataFrame, starts: np.ndarray):
+    w = st["wall_ms"].to_numpy() / 3.6e6
+    dw = np.diff(w)
+    hours = w[-1] - w[0]
+    # El contador vive en memoria y vuelve a 0 cuando el servicio se reinicia.
+    ft = st["false_triggers"].to_numpy()
+    inc = np.diff(ft)
+    ft_total = ft[0] + np.where(inc >= 0, inc, ft[1:]).sum()
+    print(f"\n== stats.csv: {hours:.1f} h ==")
+    print(f"Falsos disparos/hora: {ft_total / max(hours, 1e-9):.2f} ({int(ft_total)} en total)")
+
+    # Batería: solo tramos de descarga continua (sin carga) de al menos 1 h; incluye el uso normal.
+    b = st["battery_pct"].to_numpy()
+    drop = dur = 0.0
+    i = 0
+    while i < len(b) - 1:
+        j = i
+        while j < len(b) - 1 and b[j + 1] <= b[j] and dw[j] < 0.5:
+            j += 1
+        if w[j] - w[i] >= 1:
+            drop += b[i] - b[j]; dur += w[j] - w[i]
+        i = j + 1
+    if dur:
+        print(f"Descarga de batería: {drop / dur:.2f} %/h en {dur:.1f} h sin cargar (incluye uso normal); mínimo {b.min()} %")
+
+    # Muestras perdidas: tasa de cada intervalo frente a la tasa típica del sensor en ese teléfono.
+    # No depende del umbral de huecos, que hasta la 0.2 era fijo (30 ms) e inflaba los sensores a 50 Hz.
+    # Se descartan los intervalos que cruzan un arranque del servicio: el contador empieza de cero.
+    wm = st["wall_ms"].to_numpy()
+    same = np.array([not ((starts > a) & (starts <= b)).any() for a, b in zip(wm[:-1], wm[1:])])
+    sec = (np.diff(wm) / 1e3)[same]
+    for c in ("acc", "gyr", "mag"):
+        if f"{c}_n" not in st or not len(sec):
+            continue
+        n = st[f"{c}_n"].to_numpy()[1:][same]
+        hz = n / sec
+        ref = np.percentile(hz, 90)
+        if ref <= 0:
+            continue
+        lost = 1 - n.sum() / (ref * sec.sum())
+        print(f"{c}: {ref:.0f} Hz típicos, {max(lost, 0):.1%} de muestras perdidas, "
+              f"{(hz < 0.95 * ref).sum()} de {len(hz)} intervalos con pérdida > 5 %")
+    late_ticks = (sec > 660).sum()
+    if late_ticks:
+        print(f"Registros de 10 min que llegaron tarde (> 11 min): {late_ticks} de {len(sec)} -> el sistema suspendió el proceso")
+
+
+def print_lifecycle(lc: pd.DataFrame):
+    print("\n== lifecycle.csv ==")
+    starts = lc[lc["event"] == "service_start"]["detail"].fillna("").value_counts()
+    print("Arranques del servicio:", starts.to_dict())
+    ex = lc[lc["event"] == "exit_reason"]["detail"].fillna("")
+    if len(ex):
+        reasons = ex.str.extract(r"reason=([^;]+)")[0].value_counts()
+        print("Motivo de las muertes anteriores (app 0.3+):", reasons.to_dict())
+    crashes = lc[lc["event"] == "crash"]["detail"]
+    if len(crashes):
+        print(f"Fallos de la app: {len(crashes)}")
+        for d in crashes.value_counts().head(5).index:
+            print("   ", d)
+    t = lc["wall_ms"].to_numpy() / 3.6e6
+    gaps = np.diff(t)
+    print(f"Horas sin latido (huecos > 25 min): {gaps[gaps > 25 / 60].sum():.2f}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("root", type=Path, help="carpeta extraída con adb pull (contiene episodes/ y stats.csv)")
@@ -164,17 +236,23 @@ def main():
                 rec = (pocket.origin_detected == "POCKET_OR_BAG").mean()
                 print(f"\nRecall del detector 'sacado de bolsillo/bolsa': {rec:.0%} (n={len(pocket)})")
 
+    if len(allu):
+        print("\n== Fuente del desbloqueo (poll = el broadcast no llegó a tiempo) ==")
+        print(allu.groupby(["app_version", "unlock_source"]).size().rename("n").to_string())
+        late = [float(v.split("ms=")[1]) for e in eps for v in e["events"].loc[e["events"]["name"] == "late_broadcast", "value"]]
+        if late:
+            print(f"Broadcasts que llegaron después del sondeo: {len(late)}, retraso mediano {np.median(late):.0f} ms")
+
+    lc_file = a.root / "lifecycle.csv"
+    lc = pd.read_csv(lc_file) if lc_file.exists() else None
     stats = a.root / "stats.csv"
     if stats.exists():
         st = pd.read_csv(stats)
         if len(st) > 1:
-            hours = (st["wall_ms"].iloc[-1] - st["wall_ms"].iloc[0]) / 3.6e6
-            ft = st["false_triggers"].iloc[-1] - st["false_triggers"].iloc[0]
-            batt = st["battery_pct"].iloc[0] - st["battery_pct"].iloc[-1]
-            print(f"\n== stats.csv: {hours:.1f} h ==")
-            print(f"Falsos disparos/hora: {ft / max(hours, 1e-9):.2f}")
-            print(f"Batería consumida (bruta, incluye uso normal): {batt} pts → {batt / max(hours, 1e-9):.2f} %/h")
-            print("Huecos IMU acumulados (s):", {c: round(float(st[f'{c}_gap_s'].sum()), 1) for c in ('acc', 'gyr', 'mag') if f'{c}_gap_s' in st})
+            starts = lc.loc[lc["event"] == "service_start", "wall_ms"].to_numpy() if lc is not None else np.array([])
+            print_stats(st, starts)
+    if lc is not None:
+        print_lifecycle(lc)
 
     if a.plot:
         out = a.root / "plots"; out.mkdir(exist_ok=True)

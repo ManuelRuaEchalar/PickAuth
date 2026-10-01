@@ -53,3 +53,9 @@ episodes/unlock_20261005_143012_120/
 
 La ventana es `[min(desbloqueo − pre, inicio_toma − margen), desbloqueo + x]`. La segmentación
 fina en sub-fases se hace offline; la máquina de estados solo decide *cuándo* y *qué* guardar.
+
+Desde la 0.3: `meta.json` lleva `app_version` y `event_sources` (`broadcast` o `poll`) para pantalla
+y desbloqueo. `poll` significa que el broadcast no llegó y el evento salió del sondeo cada 200 ms
+(puede ir hasta 200 ms tarde). `events.csv` anota `late_broadcast` cuando el broadcast llega después
+del sondeo, y `lifecycle.csv` registra `exit_reason` (motivo de cada muerte del proceso, Android 11+)
+y `crash`. Los datos de la 0.2 no traen estos campos; `analyze_episodes.py` los trata como `broadcast`.

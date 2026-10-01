@@ -20,8 +20,8 @@ android {
         applicationId = "edu.pickupauth"
         minSdk = 29          // Android 10
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.2-recoleccion"
+        versionCode = 3
+        versionName = "0.3-recoleccion"
         buildConfigField("String", "UPLOAD_URL", "\"${localProp("pickupauth.uploadUrl")}\"")
         buildConfigField("String", "UPLOAD_TOKEN", "\"${localProp("pickupauth.uploadToken")}\"")
     }

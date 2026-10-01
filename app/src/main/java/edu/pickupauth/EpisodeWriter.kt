@@ -63,6 +63,7 @@ class EpisodeWriter(private val ctx: Context) {
             put("sampling_period_us", Config.samplingPeriodUs)
             put("pre_s", Config.preUnlockSeconds); put("post_s", Config.postUnlockSeconds)
         })
+        meta.put("app_version", BuildConfig.VERSION_NAME)
         meta.put("subject", Config.subjectId)
         meta.put("impostor_session", Config.impostorSession)
         File(dir, "meta.json").writeText(meta.toString(2))
