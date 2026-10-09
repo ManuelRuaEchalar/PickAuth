@@ -15,3 +15,23 @@ __pycache__/
 
 # Datos de captura (biométricos, no se versionan)
 datos/
+
+# Datasets públicos de referencia (pesados, se descargan aparte)
+datasets/
+
+# PDFs de papers (copyright); la lista bibliografia/*.md sí se versiona
+bibliografia/**/*.pdf
+pruebas_de_implementacion/_local/
+_subir/
+
+# Solo se versiona código: documentos, datos y entregables quedan fuera
+tesis/
+bibliografia/
+dataset_PickAuth*/
+*.zip
+*.xlsx
+*.docx
+*.pdf
+/*.png
+/PickupAuth — Propuesta acotada.md
+pruebas_de_implementacion/*.md
